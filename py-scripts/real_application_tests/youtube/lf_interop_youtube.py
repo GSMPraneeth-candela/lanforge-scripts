@@ -126,9 +126,6 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from threading import Event, Thread
 import traceback
-import platform
-import signal
-import subprocess
 from collections import Counter
 import re
 from urllib import error as urllib_error
@@ -276,8 +273,8 @@ class Youtube(Realm):
         self.generic_endps_profile.type = 'youtube'
         self.generic_endps_profile.name_prefix = "yt"
         self.endpoint_last_status = {}
+        self.endpoint_last_status = {}
         self.Devices = None
-        self.start_time = None
         self.stop_time = None
         self.do_webUI = do_webUI
         self.ui_report_dir = ui_report_dir
@@ -290,6 +287,7 @@ class Youtube(Realm):
         self.ssid = ssid
         self.security = security
         self.band = band
+        self.start_time = None
         self.est_end_time = None
         self.all_stop = False
         self.keys = []
@@ -624,6 +622,7 @@ class Youtube(Realm):
         if real_sta_list is None:
             self.real_sta_list, _, _ = real_devices.query_user()
         else:
+            interface_data = self.json_get_with_retry("/port/all")
             interface_data = self.json_get_with_retry("/port/all")
             interfaces = interface_data["interfaces"]
             final_device_list = []  # Initialize the list
@@ -1160,13 +1159,16 @@ class Youtube(Realm):
             Request that the main test flow stop and perform its normal cleanup
             and report generation.
             """
-            if self.stop_signal:
-                return jsonify({"message": "YouTube test stop is already in progress"}), 200
+            logging.info("Stopping the test through web UI")
 
-            logger.info("Stopping the test through WebUI")
-            self.stop_signal = True
+            response = jsonify({"message": "Stopping Youtube Test"})
+            response.status_code = 200
 
-            return jsonify({"message": "YouTube test stop requested"}), 200
+            # Start shutdown in a separate thread
+            shutdown_thread = Thread(target=self.shutdown)
+            shutdown_thread.start()
+
+            return response
 
         @app.route('/youtube_stats', methods=['GET', 'POST'])
         def youtube_stats():
@@ -2069,176 +2071,85 @@ class Youtube(Realm):
 
         return response
 
-    def write_endpoint_status_csv(self, csv_file, endpoint_name, status,
-                                  api_response=None):
-        """Append an endpoint status change to the monitoring CSV."""
-        file_exists = os.path.isfile(csv_file) and os.path.getsize(csv_file) > 0
-        with open(csv_file, mode="a", newline="") as csv_handle:
-            writer = csv.writer(csv_handle)
-            if not file_exists:
-                writer.writerow([
-                    "timestamp", "endpoint_name", "status", "api_response"
-                ])
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                endpoint_name,
-                status,
-                json.dumps(api_response, default=str, sort_keys=True),
-            ])
-
     def monitor_endpoint_status_changes(self, wait_time=40, poll_interval=5):
         """
-        Record endpoint status changes.  If every endpoint disappears, retry
-        for ``wait_time`` seconds and then unwind to report generation.
+        Checks the current status of every generic endpoint and, only the
+        first time an endpoint's status changes, logs a message and appends
+        a row (timestamp, endpoint_name, status) to
+        endpoint_status_changes.csv. Repeated polls of an unchanged status
+        are not logged or written again.
+
+        If every created endpoint is missing from the response, retries
+        every poll_interval seconds for up to wait_time seconds. Aborts the
+        test if still none of the created endpoints have responded once
+        wait_time has elapsed.
         """
         current_path = self.ui_report_dir if self.do_webUI else os.path.dirname(os.path.abspath(__file__))
         csv_file = os.path.join(current_path, "endpoint_status_changes.csv")
         if csv_file not in self.devices_list:
             self.devices_list.append(csv_file)
         created_endp = self.generic_endps_profile.created_endp
-        start_time = time.time()
-        while True:
-            if self.stop_signal:
-                logger.info(
-                    "WebUI stop requested while waiting for endpoint data; "
-                    "unwinding directly to report generation."
-                )
-                raise WebUIStopRequested
 
-            endpoint_data = {}
-            endpoint_responses = {}
+        start_time = time.time()
+        endpoint_data = {}
+        while True:
             for gen_endp in created_endp:
-                if self.stop_signal:
-                    logger.info(
-                        "WebUI stop requested during endpoint polling; "
-                        "unwinding directly to report generation."
-                    )
-                    raise WebUIStopRequested
                 generic_endpoint = self.json_get(f"/generic/{gen_endp}")
-                endpoint_responses[gen_endp] = generic_endpoint
                 if generic_endpoint and "endpoint" in generic_endpoint:
                     endpoint_data[gen_endp] = generic_endpoint
 
-            newly_missing = [
-                gen_endp for gen_endp in created_endp
-                if gen_endp not in endpoint_data
-                and self.endpoint_last_status.get(gen_endp) != "MISSING"
-            ]
-            missing_url = f"/generic/{','.join(sorted(set(created_endp)))}"
-            present_keys = []
-            if newly_missing:
-                try:
-                    combined_response = self.json_get(missing_url)
-                    if combined_response and "endpoints" in combined_response:
-                        present_keys = [
-                            name for endpoint in combined_response["endpoints"]
-                            for name in endpoint
-                        ]
-                    elif combined_response and "endpoint" in combined_response:
-                        present_keys = list(endpoint_data)
-                except Exception:
-                    logger.exception(
-                        "Unable to retrieve combined endpoint status from %s",
-                        missing_url,
-                    )
-
-            for gen_endp in created_endp:
-                generic_endpoint = endpoint_data.get(gen_endp)
-                current_status = (
-                    generic_endpoint["endpoint"].get("status", "")
-                    if generic_endpoint else "MISSING"
-                )
-                if self.endpoint_last_status.get(gen_endp) != current_status:
-                    if current_status == "MISSING":
-                        logger.info(
-                            "Endpoint '%s' is unavailable (endpoint_present=False). "
-                            "It may have been deleted, may not have been created, "
-                            "or may be temporarily disconnected. Continuing to "
-                            "monitor it.\nURL: %s\nEndpoint keys present: %s",
-                            gen_endp,
-                            missing_url,
-                            present_keys,
-                        )
-                    else:
-                        logger.info(
-                            "Endpoint %s status changed to: %s",
-                            gen_endp,
-                            current_status,
-                        )
-                    self.write_endpoint_status_csv(
-                        csv_file,
-                        gen_endp,
-                        current_status,
-                        (present_keys if current_status == "MISSING" else
-                         endpoint_responses.get(gen_endp)),
-                    )
-                    self.endpoint_last_status[gen_endp] = current_status
-
-            if endpoint_data:
-                return True
-
-            missing_for = time.time() - start_time
-            if missing_for >= wait_time:
-                logger.error(
-                    "All %s generic endpoint(s) have been unreachable for %.0fs "
-                    "(limit %ss) - stopping the test.",
-                    len(created_endp),
-                    missing_for,
-                    wait_time,
-                )
-                self.write_endpoint_status_csv(
-                    csv_file,
-                    "ALL",
-                    "ALL_ENDPOINTS_UNREACHABLE",
-                    endpoint_responses,
-                )
-                raise AllEndpointsUnreachable(
-                    f"All generic endpoints were unreachable for {wait_time} seconds"
-                )
+            if endpoint_data or (time.time() - start_time) >= wait_time:
+                break
 
             logger.warning(
-                "All %s generic endpoint(s) are unreachable - retrying... "
-                "%.0fs/%ss before giving up and stopping the test.",
-                len(created_endp),
-                missing_for,
-                wait_time,
+                "No data received for any of the created endpoints; retrying..."
             )
-            # Sleep in short intervals so a WebUI stop is acted on promptly,
-            # even while this method is in its missing-endpoint retry window.
-            retry_deadline = time.monotonic() + poll_interval
-            while time.monotonic() < retry_deadline:
-                if self.stop_signal:
-                    logger.info(
-                        "WebUI stop requested while waiting for endpoint data; "
-                        "unwinding directly to report generation."
-                    )
-                    raise WebUIStopRequested
-                remaining = retry_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                time.sleep(min(0.25, remaining))
+            time.sleep(poll_interval)
 
-    def check_gen_cx(self, stall_timeout=300):
-        """Check whether all generic endpoints have reached an idle state.
-        Treat unresponsive or stalled endpoints as resolved after stall_timeout.
-        """
-        if not hasattr(self, "_gen_cx_stall_since"):
-            self._gen_cx_stall_since = {}
-        if not hasattr(self, "_gen_cx_timed_out"):
-            self._gen_cx_timed_out = set()
+        if not endpoint_data:
+            logger.error(
+                f"No data received for any of the created endpoints after waiting "
+                f"{wait_time} seconds. Aborting test."
+            )
+            exit(1)
 
-        idle_statuses = {"Stopped", "WAITING", "NO-CX", "PHANTOM", "FTM_WAIT"}
-        now = time.monotonic()
-        ready = True
+        for gen_endp, generic_endpoint in endpoint_data.items():
+            current_status = generic_endpoint["endpoint"].get("status", "")
+            previous_status = self.endpoint_last_status.get(gen_endp)
 
+            if current_status == previous_status:
+                continue
+
+            logger.info(
+                f"Endpoint {gen_endp} status changed to: {current_status}"
+            )
+
+            file_exists = os.path.isfile(csv_file) and os.path.getsize(csv_file) > 0
+            with open(csv_file, mode="a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "endpoint_name", "status"])
+                writer.writerow(
+                    [
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        gen_endp,
+                        current_status,
+                    ]
+                )
+
+            self.endpoint_last_status[gen_endp] = current_status
+
+    def check_gen_cx(self):
         try:
-            for gen_endp in set(self.generic_endps_profile.created_endp):
-                generic_endpoint = self.json_get(f"/generic/{gen_endp}")
+
+            for gen_endp in self.generic_endps_profile.created_endp:
+                generic_endpoint = self.json_get(f'/generic/{gen_endp}')
 
                 if not generic_endpoint or "endpoint" not in generic_endpoint:
-                    endp_status = None
-                else:
-                    endp_status = generic_endpoint["endpoint"].get("status", "")
+                    logging.error(f"Error fetching endpoint data for {gen_endp}")
+                    return False
+
+                endp_status = generic_endpoint["endpoint"].get("status", "")
 
                 if endp_status in idle_statuses:
                     self._gen_cx_stall_since.pop(gen_endp, None)
@@ -2295,7 +2206,9 @@ class Youtube(Realm):
             target_port_list = self.name_to_eid(upstream_port)
             shelf, resource, port, _ = target_port_list
             response = self.json_get_with_retry(f'/port/{shelf}/{resource}/{port}?fields=ip')
+            response = self.json_get_with_retry(f'/port/{shelf}/{resource}/{port}?fields=ip')
             try:
+                target_port_ip = response['interface']['ip']
                 target_port_ip = response['interface']['ip']
                 upstream_port = target_port_ip
             except KeyError as e:
@@ -2419,15 +2332,16 @@ class Youtube(Realm):
             None
         """
         interop_data = self.json_get_with_retry('/adb')
+
         try:
-            interop_mobile_data = interop_data.get('devices', {})
+            interop_mobile_data = interop_data['devices']
 
             if isinstance(interop_mobile_data, dict):
                 for user in self.user_list:
                     if user != '':
-                        if interop_mobile_data.get('user-name') == user:
+                        if interop_mobile_data['user-name'] == user:
 
-                            serial = interop_mobile_data.get('name', '')
+                            serial = interop_mobile_data['name']
                             resource = serial.split('.')[1]
                             serial_no = serial.split('.')[2]
                             self.serial_list.append(serial_no)
@@ -2439,13 +2353,27 @@ class Youtube(Realm):
                     if user != '':
                         for mobile_device in interop_mobile_data:
                             for serial, device_data in mobile_device.items():
-                                if device_data.get('user-name') == user:
+                                if device_data['user-name'] == user:
                                     resource = serial.split('.')[1]
                                     serial_no = serial.split('.')[2]
                                     self.serial_list.append(serial_no)
                                     lanforge_port = f"1.{resource}.eth0"
                                     self.lanforge_port_list.add(lanforge_port)
                                     break
+        except KeyError as e:
+            logger.error(
+                "/adb response is not in the expected format, missing key %s. "
+                "Data received:\n%s",
+                e,
+                json.dumps(interop_data, indent=2, default=str),
+            )
+            exit(1)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error while parsing /adb response: {e}",
+                exc_info=True,
+            )
+            exit(1)
 
             self.lanforge_port_list = list(self.lanforge_port_list)
             self.lanforge_os_type = ["Linux"] * len(self.lanforge_port_list)
@@ -2509,10 +2437,10 @@ class Youtube(Realm):
 
         # Step 1: Retrieve information about all resources
         response = self.json_get_with_retry("/resource/all")
-        try:
-            resource_data_list = response.get("resources", [])
 
-            # Step 2: Match user-specified resources with available resources in order.
+        # Step 2: Match user-specified resources with available resources in order.
+        try:
+            resource_data_list = response["resources"]
             for user_resource in user_resources:
                 for resource_entry in resource_data_list:
                     for resource_key, resource_values in resource_entry.items():
@@ -2558,19 +2486,19 @@ class Youtube(Realm):
 
         # Step 3: Retrieve port information
         response_port = self.json_get_with_retry("/port/all")
+
         try:
-            interfaces_list = response_port.get('interfaces', [])
+            interfaces_list = response_port["interfaces"]
 
             # Step 4: Match ports associated with retrieved resources in the order of ports_list
             for port_entry in ports_list:
                 expected_eid = port_entry['eid']
                 matched_ports = []
-                mac = "NA"
-                rssi = "NA"
-                link_rate = "NA"
-                ssid = "NA"
-                wifi_interface = "NA"
 
+                for interface in interfaces_list:
+                    for port, port_data in interface.items():
+                        if '.'.join(port.split('.')[:2]) == expected_eid:
+                            matched_ports.append((port, port_data))
                 for interface in interfaces_list:
                     for port, port_data in interface.items():
                         if '.'.join(port.split('.')[:2]) == expected_eid:
@@ -2578,35 +2506,16 @@ class Youtube(Realm):
 
                 for port_name, port_data in matched_ports:
                     if port_data.get("parent dev") == 'wiphy0' and not port_data.get('down') and port_data.get('ip') != '0.0.0.0':
-                        mac = port_data.get("mac") or "NA"
-                        rssi = port_data.get("signal")
-                        if rssi is None or str(rssi).strip().upper() in ("", "NA"):
-                            rssi = "NA"
-                        else:
-                            rssi_text = str(rssi).strip()
-                            rssi = rssi_text if "dbm" in rssi_text.lower() else f"{rssi_text} dBm"
-                        link_rate = port_data.get("rx-rate") if port_data.get("rx-rate") is not None else "NA"
-                        ssid = port_data.get("ssid") or "NA"
-                        port_parts = port_name.split('.')
-                        wifi_interface = port_parts[2] if len(port_parts) > 2 else "NA"
-                        break
-
-                self.mac_list.append(mac)
-                self.rssi_list.append(rssi)
-                self.link_rate_list.append(link_rate)
-                self.ssid_list.append(ssid)
-                self.wifi_interface_list.append(wifi_interface)
-
-                if wifi_interface == "NA":
-                    logger.warning(
-                        "No active wiphy0 interface with a valid IP was found for "
-                        "resource %s; network details will be reported as NA",
-                        expected_eid,
-                    )
+                        self.mac_list.append(port_data.get("mac"))
+                        self.rssi_list.append(port_data.get("signal"))
+                        self.link_rate_list.append(port_data.get("rx-rate"))
+                        self.ssid_list.append(port_data.get("ssid"))
+                        self.wifi_interface_list.append(port_name.split('.')[2])
         except KeyError as e:
             logger.error(
-                f"/port/all response is not in the expected format, missing key {e}. "
+                "/port/all response is not in the expected format, missing key %s. "
                 "Data received:\n%s",
+                e,
                 json.dumps(response_port, indent=2, default=str),
             )
             exit(1)
@@ -2657,6 +2566,7 @@ class Youtube(Realm):
                             end_time = datetime.now() + timedelta(minutes=self.duration)
 
                         self.monitor_endpoint_status_changes()
+                        self.monitor_endpoint_status_changes()
                         time.sleep(5)
 
                     if self.stop_signal:
@@ -2691,6 +2601,7 @@ class Youtube(Realm):
                         self.start_generic()
                         end_time = datetime.now() + timedelta(minutes=self.duration)
 
+                    self.monitor_endpoint_status_changes()
                     self.monitor_endpoint_status_changes()
                     time.sleep(5)
 
@@ -3645,7 +3556,7 @@ NOTES:
                 duration = args.duration
                 end_time = datetime.now() + timedelta(minutes=duration)
 
-                while (datetime.now() < end_time or not youtube.check_gen_cx()) and not youtube.stop_signal:
+                while datetime.now() < end_time or not youtube.check_gen_cx():
                     youtube.monitor_endpoint_status_changes()
                     time.sleep(1)
 
