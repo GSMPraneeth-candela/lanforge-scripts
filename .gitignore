@@ -169,3 +169,17 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+*.pdf
+/.vscode
+/graphify-out
+*.csv
+*.html
+*.png
+*.css
+*.woff
+*.ico
+*.jpg
+*.txt
+/py-scripts/reports
+/py-scripts/real_application_tests/graphify-out
